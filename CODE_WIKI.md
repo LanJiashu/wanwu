@@ -1502,6 +1502,262 @@ make -f Makefile.develop run-agent
 
 ---
 
-> **文档版本**: v1.1  
+## 14. Docker Volume 详解
+
+### 14.1 什么是 Docker Volume？
+
+**Docker Volume** 是 Docker 提供的一种**数据持久化机制**，用于将容器内的数据存储到宿主机上，实现数据与容器生命周期的分离。
+
+#### 核心概念
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  容器 (Container)              宿主机 (Host)                 │
+│  ┌──────────────┐              ┌──────────────┐             │
+│  │  应用代码     │              │              │             │
+│  │  ├─ 二进制    │              │  Docker      │             │
+│  │  ├─ 配置      │              │  Volume      │             │
+│  │  └─ 运行时    │              │  存储区域     │             │
+│  │              │              │              │             │
+│  │  /var/lib/   │◄────────────►│ /var/lib/    │             │
+│  │  mysql/data  │   Volume     │ docker/      │             │
+│  │              │   映射       │ volumes/     │             │
+│  └──────────────┘              └──────────────┘             │
+│                                                              │
+│  容器删除后：应用代码消失，但 Volume 数据保留在宿主机          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### Volume 的三种类型
+
+| 类型 | 语法 | 用途 | 示例 |
+|------|------|------|------|
+| **命名 Volume** | `volume_name:/path` | Docker 管理，推荐用于数据持久化 | `wanwu_mysql_data:/var/lib/mysql` |
+| **绑定挂载** | `/host/path:/container/path` | 宿主机路径直接挂载，开发常用 | `./bin/amd64/bff-service:/app/bin/bff-service` |
+| **匿名 Volume** | `/path` (无名称) | 临时数据，容器删除后自动清理 | 较少使用 |
+
+### 14.2 本项目中的 Volume 使用
+
+#### 生产环境 (`docker-compose.yaml`)
+
+```yaml
+services:
+  mysql:
+    volumes:
+      - wanwu_mysql_data:/var/lib/mysql  # 命名 Volume：MySQL 数据持久化
+
+  redis:
+    volumes:
+      - wanwu_redis_data:/data           # 命名 Volume：Redis 数据持久化
+
+  minio:
+    volumes:
+      - wanwu_minio_data:/data           # 命名 Volume：对象存储数据持久化
+
+  es:
+    volumes:
+      - wanwu_es_data:/usr/share/elasticsearch/data   # ES 索引数据
+      - wanwu_es_certs:/usr/share/elasticsearch/config/certs  # TLS 证书
+
+# Volume 定义（在文件底部）
+volumes:
+  wanwu_mysql_data:    # Docker 自动创建和管理
+  wanwu_redis_data:
+  wanwu_minio_data:
+  wanwu_es_data:
+  wanwu_es_certs:
+```
+
+#### 开发环境 (`docker-compose-develop.yaml`)
+
+```yaml
+services:
+  bff-service:
+    volumes:
+      # 绑定挂载：本地编译的二进制直接映射到容器
+      - ./bin/${WANWU_ARCH}/bff-service:/app/bin/bff-service
+      # 绑定挂载：本地配置文件映射到容器
+      - ./configs/microservice/bff-service/configs:/app/configs/microservice/bff-service/configs
+
+  rag:
+    volumes:
+      # 绑定挂载：整个 Python 源码目录映射到容器
+      - ./rag/rag_open_source:/model_extend
+
+  callback:
+    volumes:
+      # 绑定挂载：整个 callback 源码目录映射到容器
+      - ./callback:/callback
+```
+
+### 14.3 Volume 数据存储位置
+
+#### 命名 Volume 的宿主机路径
+
+```bash
+# Docker 管理的 Volume 默认存储在
+/var/lib/docker/volumes/
+
+# 例如 MySQL Volume 的实际路径
+/var/lib/docker/volumes/wanwu_mysql_data/_data/
+
+# 查看所有 Volume
+docker volume ls
+
+# 查看 Volume 详情
+docker volume inspect wanwu_mysql_data
+```
+
+#### 绑定挂载的宿主机路径
+
+```bash
+# 绑定挂载直接使用宿主机路径
+# 例如：./bin/amd64/bff-service 映射到容器内的 /app/bin/bff-service
+# 宿主机的相对路径就是项目目录下的 bin/amd64/bff-service
+```
+
+### 14.4 Volume 生命周期管理
+
+#### 查看 Volume
+
+```bash
+# 列出所有 Volume
+docker volume ls
+
+# 输出示例：
+# DRIVER    VOLUME NAME
+# local     wanwu_mysql_data
+# local     wanwu_redis_data
+# local     wanwu_minio_data
+# local     wanwu_es_data
+```
+
+#### 创建 Volume
+
+```bash
+# 手动创建命名 Volume
+docker volume create my_volume
+```
+
+#### 删除 Volume
+
+```bash
+# 删除指定 Volume（谨慎操作！）
+docker volume rm wanwu_mysql_data
+
+# 删除所有未使用的 Volume
+docker volume prune
+
+# ⚠️ 危险：docker compose down -v 会删除所有关联 Volume
+docker compose down -v
+```
+
+#### 备份 Volume
+
+```bash
+# 方法 1：使用临时容器打包备份
+docker run --rm \
+  -v wanwu_mysql_data:/data \
+  -v $(pwd)/backup:/backup \
+  alpine tar czf /backup/mysql_$(date +%Y%m%d).tar.gz -C /data .
+
+# 方法 2：针对 MySQL 使用 mysqldump
+docker exec mysql-wanwu \
+  mysqldump -u root -p'Wanwu123456' --all-databases \
+  > backup_$(date +%Y%m%d).sql
+```
+
+#### 恢复 Volume
+
+```bash
+# 从备份恢复
+docker run --rm \
+  -v wanwu_mysql_data:/data \
+  -v $(pwd)/backup:/backup \
+  alpine sh -c "cd /data && tar xzf /backup/mysql_20260115.tar.gz"
+```
+
+### 14.5 为什么代码更新不会丢失数据？
+
+```
+代码更新流程：
+
+1. 停止容器
+   docker compose down
+   │
+   ├── 容器 bff-service 停止并删除 ❌
+   ├── 容器 mysql 停止并删除 ❌
+   ├── Volume wanwu_mysql_data 保留 ✅
+   └── Volume wanwu_redis_data 保留 ✅
+
+2. 更新代码 / 重新编译
+   git pull
+   make build-bff-amd64
+   │
+   └── 只影响宿主机上的二进制文件
+
+3. 启动新容器
+   docker compose up -d
+   │
+   ├── 创建新的 bff-service 容器（包含新代码）✅
+   ├── 创建新的 mysql 容器 ✅
+   ├── 重新挂载 Volume wanwu_mysql_data ✅
+   └── 数据完整保留！
+```
+
+### 14.6 Volume vs 容器文件系统
+
+| 特性 | 容器内文件 | Volume 挂载的文件 |
+|------|-----------|------------------|
+| 生命周期 | 随容器删除而丢失 | 独立于容器，持久保留 |
+| 性能 | 使用联合文件系统，有开销 | 直接访问宿主机文件系统，性能更好 |
+| 共享 | 容器间隔离 | 可被多个容器共享挂载 |
+| 备份 | 困难 | 可直接备份宿主机目录 |
+| 适用场景 | 应用代码、临时文件 | 数据库数据、用户上传文件、日志 |
+
+### 14.7 常见问题
+
+**Q: Volume 数据会占用多少磁盘空间？**
+
+A: 取决于实际数据量。可以通过以下命令查看：
+```bash
+# 查看 Volume 磁盘使用
+docker system df -v
+
+# 查看特定目录大小
+du -sh /var/lib/docker/volumes/wanwu_mysql_data/_data
+```
+
+**Q: 如何迁移数据到另一台机器？**
+
+A:
+```bash
+# 1. 在原机器备份 Volume
+docker run --rm -v wanwu_mysql_data:/data -v $(pwd):/backup alpine \
+  tar czf /backup/mysql_data.tar.gz -C /data .
+
+# 2. 传输备份文件到新机器
+scp mysql_data.tar.gz new-server:/backup/
+
+# 3. 在新机器恢复
+docker volume create wanwu_mysql_data
+docker run --rm -v wanwu_mysql_data:/data -v /backup:/backup alpine \
+  tar xzf /backup/mysql_data.tar.gz -C /data
+```
+
+**Q: 开发模式下修改 Volume 挂载的源码需要重启容器吗？**
+
+A:
+- **Go 二进制**：需要重新编译并重启容器（因为二进制文件被替换后需要重新加载）
+- **Python 源码**：通常不需要重启（解释型语言，下次请求会读取新代码）
+- **前端代码**：开发模式热更新，生产模式需要重新构建
+
+**Q: 容器崩溃会导致 Volume 数据损坏吗？**
+
+A: 一般不会。Volume 数据存储在宿主机文件系统上，容器崩溃不会影响宿主机上的数据。但如果在崩溃瞬间有未完成的写操作，可能会导致数据不一致，建议使用数据库的事务机制来保证数据完整性。
+
+---
+
+> **文档版本**: v1.2  
 > **适用项目版本**: Wanwu v0.4.0+  
 > **最后更新**: 2026-05-14
