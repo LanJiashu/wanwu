@@ -1229,6 +1229,279 @@ docker compose --env-file .env --env-file .env.image.amd64 up -d
 
 ---
 
-> **文档版本**: v1.0  
+## 13. 代码更新与重新部署指南
+
+### 13.1 是否需要重新构建 Docker 镜像？
+
+**取决于代码更新的范围和部署方式**：
+
+| 场景 | 是否需要重建镜像 | 操作方式 |
+|------|----------------|----------|
+| **生产部署** (使用 `docker-compose.yaml` 拉取远程镜像) | **是** | 重新构建镜像并推送，或拉取新镜像 |
+| **开发部署** (使用 `docker-compose-develop.yaml` 挂载本地二进制) | **否** | 重新编译二进制文件，重启容器即可 |
+| **前端代码更新** | 视情况 | 开发模式直接刷新；生产模式需重新构建 |
+| **Python RAG/Callback 代码更新** | **否** (开发模式) | 直接修改代码，重启容器 |
+| **Protobuf 定义更新** | **是** | 重新生成代码，重新编译/构建 |
+
+### 13.2 开发模式快速更新 (推荐开发时使用)
+
+项目提供了 `docker-compose-develop.yaml`，**通过 Volume 挂载本地编译的二进制文件和源码**，实现代码更新后快速生效：
+
+#### Go 后端服务更新
+
+```bash
+# 1. 停止目标服务 (以 bff-service 为例)
+make -f Makefile.develop stop-bff
+
+# 2. 重新编译二进制文件
+make build-bff-amd64
+# 输出: ./bin/amd64/bff-service
+
+# 3. 重新启动服务 (docker-compose-develop.yaml 会自动挂载新的二进制)
+make -f Makefile.develop run-bff
+```
+
+**关键机制**：`docker-compose-develop.yaml` 中使用 Volume 挂载本地二进制：
+
+```yaml
+bff-service:
+  volumes:
+    - ./bin/${WANWU_ARCH}/bff-service:/app/bin/bff-service  # 挂载本地编译的二进制
+    - ./configs/microservice/bff-service/configs:/app/configs/microservice/bff-service/configs  # 挂载配置
+```
+
+#### Python RAG 服务更新
+
+```bash
+# 1. 停止 RAG 服务
+make -f Makefile.develop stop-rag-wanwu
+
+# 2. 直接修改 rag/ 目录下的 Python 代码
+
+# 3. 重新启动服务 (代码通过 Volume 实时挂载)
+make -f Makefile.develop run-rag-wanwu
+```
+
+**关键机制**：`docker-compose-develop.yaml` 中挂载整个源码目录：
+
+```yaml
+rag:
+  volumes:
+    - ./rag/rag_open_source:/model_extend  # 挂载整个 RAG 源码目录
+```
+
+#### Python Callback 服务更新
+
+```bash
+# 1. 停止 Callback 服务
+make -f Makefile.develop stop-callback
+
+# 2. 直接修改 callback/ 目录下的 Python 代码
+
+# 3. 重新启动服务
+make -f Makefile.develop run-callback
+```
+
+**关键机制**：`docker-compose-develop.yaml` 中挂载整个 callback 目录：
+
+```yaml
+callback:
+  volumes:
+    - ./callback:/callback  # 挂载整个 callback 源码目录
+```
+
+#### 前端更新
+
+```bash
+cd web
+
+# 开发模式：热更新，保存即刷新
+pnpm serve
+
+# 生产模式：重新构建
+pnpm build
+# 然后将 dist/ 目录内容复制到 nginx 服务目录
+```
+
+### 13.3 生产模式更新 (使用预构建镜像)
+
+如果使用 `docker-compose.yaml` (生产部署，拉取远程镜像)：
+
+```bash
+# 1. 停止所有服务
+docker compose --env-file .env --env-file .env.image.amd64 down
+
+# 2. 更新代码
+git pull
+
+# 3. 重新构建镜像
+make docker-image-backend   # 构建后端镜像
+make docker-image-frontend  # 构建前端镜像
+make docker-image-rag       # 构建 RAG 镜像
+make docker-image-callback  # 构建 Callback 镜像
+
+# 4. 推送镜像到仓库 (如果需要)
+docker push wanwulite/wanwu-backend:${WANWU_VERSION}
+docker push wanwulite/wanwu-frontend:${WANWU_VERSION}
+# ...
+
+# 5. 重新启动
+docker compose --env-file .env --env-file .env.image.amd64 up -d
+```
+
+### 13.4 数据库数据会丢失吗？
+
+**不会丢失**。数据通过 Docker Volume 持久化存储，与容器生命周期分离：
+
+#### 数据持久化机制
+
+| 服务 | Volume 名称 | 挂载路径 | 数据内容 |
+|------|------------|----------|----------|
+| MySQL | `wanwu_mysql_data` | `/var/lib/mysql` | 所有业务数据 |
+| Redis | `wanwu_redis_data` | `/data` | 缓存、会话 |
+| MinIO | `wanwu_minio_data` | `/data` | 上传的文件、文档 |
+| Kafka | `wanwu_kafka_data` | `/bitnami/kafka/data` | 消息队列数据 |
+| Elasticsearch | `wanwu_es_data` | `/usr/share/elasticsearch/data` | 向量索引、全文索引 |
+| ES 证书 | `wanwu_es_certs` | `/usr/share/elasticsearch/config/certs` | TLS 证书 |
+
+#### 关键要点
+
+1. **`docker compose down` 不会删除 Volume 数据**
+   - 数据存储在 Docker 管理的 Volume 中，与容器分离
+   - 只有执行 `docker compose down -v` 或 `docker volume rm` 才会删除
+
+2. **代码更新只影响应用容器，不影响数据 Volume**
+   ```bash
+   # 安全：只停止容器，保留 Volume
+   docker compose down
+   
+   # 危险：会删除 Volume 和数据！
+   docker compose down -v
+   ```
+
+3. **开发模式下的日志和临时文件**
+   ```yaml
+   # docker-compose-develop.yaml 中的挂载
+   volumes:
+     - ${WANWU_PROJECT_DIR}/bff-service/log:/app/log  # 日志持久化到宿主机
+     - ${WANWU_PROJECT_DIR}/bff-service/tmp:/app/tmp  # 临时文件
+   ```
+
+### 13.5 不同更新场景的操作清单
+
+#### 场景 1：只修改 Go 业务代码
+
+```bash
+# 1. 编译更新的服务
+make build-bff-amd64
+make build-agent-amd64
+# ...
+
+# 2. 重启对应服务
+make -f Makefile.develop stop-bff
+make -f Makefile.develop run-bff
+```
+
+#### 场景 2：修改 Protobuf 定义
+
+```bash
+# 1. 更新 .proto 文件
+
+# 2. 重新生成 Go 代码
+make grpc-protoc
+
+# 3. 重新编译所有依赖该 proto 的服务
+make build-bff-amd64
+make build-agent-amd64
+make build-assistant-amd64
+# ...
+
+# 4. 重启服务
+```
+
+#### 场景 3：修改数据库模型 (GORM)
+
+```bash
+# 1. 更新 Go struct 定义
+
+# 2. 编译服务
+make build-iam-amd64
+make build-knowledge-amd64
+# ...
+
+# 3. 执行数据库迁移 (如果有迁移脚本)
+# 注意：项目使用 GORM AutoMigrate，启动时自动同步表结构
+
+# 4. 重启服务
+```
+
+#### 场景 4：修改前端代码
+
+```bash
+cd web
+
+# 开发模式：自动热更新
+pnpm serve
+
+# 生产模式：构建并部署
+pnpm build
+# 复制 dist/ 到 nginx 目录
+```
+
+#### 场景 5：修改 Python RAG 代码
+
+```bash
+# 1. 直接修改 rag/ 目录代码
+
+# 2. 重启 RAG 服务
+make -f Makefile.develop stop-rag-wanwu
+make -f Makefile.develop run-rag-wanwu
+```
+
+### 13.6 数据备份建议 (重要)
+
+虽然代码更新不会丢失数据，但建议定期备份：
+
+```bash
+# MySQL 备份
+docker exec mysql-wanwu mysqldump -u root -p'Wanwu123456' --all-databases > backup_$(date +%Y%m%d).sql
+
+# MinIO 备份
+docker run --rm -v wanwu_minio_data:/data -v $(pwd)/backup:/backup alpine tar czf /backup/minio_$(date +%Y%m%d).tar.gz -C /data .
+
+# Elasticsearch 快照
+# 使用 ES Snapshot API 创建索引快照
+```
+
+### 13.7 常见问题
+
+**Q: 更新后服务启动失败怎么办？**
+
+A: 检查以下几点：
+1. 是否重新编译了二进制文件？
+2. 配置文件是否有更新？对比 `.env.bak` 和 `.env`
+3. 数据库连接是否正常？
+4. 查看服务日志：`docker logs bff-service`
+
+**Q: 更新后需要清理缓存吗？**
+
+A: 视情况而定：
+- 修改业务逻辑：无需清理缓存
+- 修改权限/角色：可能需要清理 Redis 缓存
+- 修改静态资源：清理浏览器缓存或 CDN 缓存
+
+**Q: 可以只更新单个服务吗？**
+
+A: 可以。微服务架构支持独立更新：
+```bash
+# 只更新 agent-service
+make build-agent-amd64
+make -f Makefile.develop stop-agent
+make -f Makefile.develop run-agent
+```
+
+---
+
+> **文档版本**: v1.1  
 > **适用项目版本**: Wanwu v0.4.0+  
 > **最后更新**: 2026-05-14
